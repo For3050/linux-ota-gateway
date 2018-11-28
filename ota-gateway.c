@@ -40,19 +40,11 @@
 #define SERVER_THREAD_COUNT 2
 #define SPI_READ_BUF_LEN  16
 #define SPI_WRITE_BUF_LEN  140
+#define PAYLOAD_SIZE 64
 
-#define OTA_BLOCK_SIZE 128
-
-#define OTA_START_COMMAND 0x01
-#define OTA_SEND_COMMAND 0x02
-#define OTA_REQUEST_COMMAND 0x03
-/**********************************************************************************/
-void* monitor_cc2650_thread(void* arg_info);
-void* process_request_thread(void* arg_info);
+#define OTA_ERROR_FRAME 0x02
 
 /**********************************************************************************/
-typedef void*(*THREAD_FUNC)(void*);
-
 typedef struct ARG_INFO
 {
 	int spi_fd;
@@ -61,31 +53,35 @@ typedef struct ARG_INFO
 
 arg_info_t arg_info;
 
-struct image_msg
-{
-	int command;  //command = 1 for ota;
-	int ota_target;  //target = 0x01 for smart controller;
-	int payload_size;  
-	uint32_t image_size;  //unit: byte
-}image_msg_t, *image_msg_pt;
 
-
-typedef struct S_C_FRAME //server to client
+struct FRAME
 {
-	int command;  	//command = 0x02 for OTA frame;
-	int frame_len;
+	uint8_t func;
+	uint16_t frame_id;
+	uint16_t total_frame;
+	uint8_t length;
+	uint8_t payload[PAYLOAD_SIZE];
 	uint16_t crc;
-	uint32_t frame_count;
-	uint8_t payload[OTA_BLOCK_SIZE];
-}sc_frame_t, *sc_frame_pt;
+};
 
-typedef struct C_S_FRAME //client to server
+struct ACK
 {
-	int command;   //command = 0x03 for CLIENT REQUEST;
-	uint32_t frame_count;
-}cs_frame_t, *cs_frame_pt;
+	uint8_t func;
+	uint16_t frame_id;
+	uint16_t crc;
+};
+
+static uint16_t frame_id = 0;
+static uint16_t total_frame = 0;
+static uint32_t off_addr = 0;
+/**********************************************************************************/
 
 /**********************************************************************************/
+void* monitor_cc2650_thread(void* arg_info);
+void* process_request_thread(void* arg_info);
+typedef void*(*THREAD_FUNC)(void*);
+/**********************************************************************************/
+
 static int spi_read_len = 0;
 static int spi_write_len = 0;
 static uint8_t spi_read_buf[SPI_READ_BUF_LEN] = {0x00,};
@@ -94,13 +90,8 @@ static uint8_t spi_write_buf[SPI_WRITE_BUF_LEN] = {0x00,};
 static pthread_t server_thread_id[SERVER_THREAD_COUNT] = {};
 static THREAD_FUNC server_thread[SERVER_THREAD_COUNT] = {monitor_cc2650_thread, process_request_thread};
 static pthread_cond_t process_request_cond = PTHREAD_COND_INITIALIZER;
+/**********************************************************************************/
 
-/**********************************************************************************/
-void main_exit(void)
-{
-	printf("gateway process exit...\n");
-}
-/**********************************************************************************/
 void* monitor_cc2650_thread(void* arg_info)
 {
 	int spi_fd = (*(arg_info_pt)arg_info).spi_fd;
@@ -138,14 +129,12 @@ void* monitor_cc2650_thread(void* arg_info)
 	printf("%s pthread exit, TID=%d\n", __FUNCTION__, (int)pthread_self());
 	return NULL;
 }
-
 /**********************************************************************************/
 void* process_request_thread(void* arg_info)
 {
 	int spi_fd = (*(arg_info_pt)arg_info).spi_fd;
 	FILE* fd = (*(arg_info_pt)arg_info).fd;
-	uint32_t frame_count = 0;
-	uint32_t off_addr = 0;
+	uint16_t request_frame = 0;
 
 	int retval = 0;
 
@@ -165,33 +154,25 @@ void* process_request_thread(void* arg_info)
 		pthread_mutex_unlock(&process_request_mutex);
 
 		/* 2, parse spi_read_buf[]; */
-		if(spi_read_buf[0] == OTA_REQUEST_COMMAND)
+		if(spi_read_buf[0] == OTA_ERROR_FRAME)
 		{
 		printf("process_request_thread:recv request command!\n");
-		frame_count = (spi_read_buf[1]<<24)||(spi_read_buf[2]<<16)\
-				   ||(spi_read_buf[3]<<8)||(spi_read_buf[4]);
+		request_frame = ((spi_read_buf[1]<<8) || (spi_read_buf[2]));
+		printf("request frame_id:%d\n", request_frame);
 
-		off_addr = frame_count * OTA_BLOCK_SIZE;
-		fseek(fd, off_addr, SEEK_SET);
+		off_addr = request_frame*PAYLOAD_SIZE;
 
-		memset(spi_write_buf, 0, sizeof(spi_write_buf));
-		spi_write_buf[0] = 0x02; //command = 0x02 for OTA FRAME;
-		spi_write_buf[1] = OTA_BLOCK_SIZE + 6; //length
-		spi_write_buf[2] = 0x00; //crc
-		spi_write_buf[3] = 0x00; //crc
-		spi_write_buf[4] = (frame_count>>24)&0xff;
-		spi_write_buf[5] = (frame_count>>16)&0xff;
-		spi_write_buf[6] = (frame_count>>8)&0xff;
-		spi_write_buf[7] = (frame_count>>0)&0xff;
-
-		fread(spi_write_buf+8, OTA_BLOCK_SIZE, 1, fd);
-
-		/* 3, send to cc2650 by spi_write(); */
-		spi_write(spi_fd, spi_write_buf, spi_write_buf[1]+2);
 		}
 		usleep(100);
 	}
 
+}
+
+
+/**********************************************************************************/
+void main_exit(void)
+{
+	printf("gateway process exit...\n");
 }
 
 /**********************************************************************************/
@@ -200,6 +181,8 @@ int main(int argc, char *argv[])
 	int pthread_ret, thread_index;
 	static arg_info_t arg_info;
 	uint32_t file_len = 0;
+	uint32_t off_size = 0;
+	//FILE* fd = (*(arg_info_pt)arg_info).fd;
 
 	if(argc != 1)
 	{
@@ -234,24 +217,58 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* 1,send ota command */
+	/* 1,parse file */
 	fseek(arg_info.fd, 0, SEEK_END);
 	file_len = ftell(arg_info.fd);
 	printf("file_len = %ld\n", file_len);
 
+	total_frame = (file_len%PAYLOAD_SIZE)+1;
+	printf("total_frame = %d\n", total_frame);
+
 	sleep(10);
 
-	memset(spi_write_buf, 0, sizeof(spi_write_buf));
-	spi_write_buf[0] = 0x01;  //command
-	spi_write_buf[1] = 0x01;  //ota_target
-	spi_write_buf[2] = 128;  //payload_size
-	spi_write_buf[3] = (file_len>>24)&0xff;  
-	spi_write_buf[4] = (file_len>>16)&0xff;  
-	spi_write_buf[5] = (file_len>>8)&0xff;  
-	spi_write_buf[6] = (file_len>>0)&0xff;  
+	/* 2,start OTA download */
+	printf("Start OTA download!\n");
+	while(off_addr <= file_len)
+	{
+		sleep(1);
 
-	spi_write(arg_info.spi_fd, spi_write_buf, 7);
-	printf("1,send OTA command!\n");
+		if((file_len - off_addr) > PAYLOAD_SIZE)
+		{
+			off_addr += PAYLOAD_SIZE;
+			off_size = PAYLOAD_SIZE;
+		}
+		else
+		{
+			off_addr += (file_len - off_addr);
+			off_size = (file_len - off_addr);
+		}
+		printf("off_addr = %ld\t, off_size = %ld\n", off_addr-PAYLOAD_SIZE, off_size);
+
+
+		frame_id = off_addr%PAYLOAD_SIZE;
+		printf("frame_id = %d\n", frame_id);
+
+		memset(spi_write_buf, 0, sizeof(spi_write_buf));
+
+		fseek(arg_info.fd, off_addr-PAYLOAD_SIZE, SEEK_SET);
+		fread(spi_write_buf+6, 1, off_size, arg_info.fd);
+
+		spi_write_buf[0] = 0x01; //FUNC
+		spi_write_buf[1] = frame_id>>8; //high byte
+		spi_write_buf[2] = frame_id; 
+		spi_write_buf[3] = total_frame>>8; 
+		spi_write_buf[4] = total_frame; 
+		spi_write_buf[5] = off_size; 
+		spi_write_buf[SPI_WRITE_BUF_LEN-2] = 0x12;  //CRC
+		spi_write_buf[SPI_WRITE_BUF_LEN-1] = 0x34;  //CRC
+
+		//spi write
+		spi_write(arg_info.spi_fd, spi_write_buf, PAYLOAD_SIZE+7);
+		printf("frame_id %d\t send out!\n", frame_id);
+
+	}
+
 
 	atexit(main_exit);
 
@@ -266,6 +283,8 @@ int main(int argc, char *argv[])
 
 	return 0;  
 }
+
+
 
 /**********************************************************************************/
 
