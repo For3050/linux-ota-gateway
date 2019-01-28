@@ -38,11 +38,13 @@
 
 /**********************************************************************************/
 #define SERVER_THREAD_COUNT 2
-#define SPI_READ_BUF_LEN  16
-#define SPI_WRITE_BUF_LEN  140
+#define SPI_READ_BUF_SIZE 16
+#define SPI_WRITE_BUF_SIZE  80
+
 #define PAYLOAD_SIZE 64
 
-#define OTA_ERROR_FRAME 0x02
+#define OTA_DOWNLOAD 		0x01
+#define OTA_ERROR_FRAME 	0x02
 
 /**********************************************************************************/
 typedef struct ARG_INFO
@@ -54,6 +56,7 @@ typedef struct ARG_INFO
 arg_info_t arg_info;
 
 
+#if 0
 struct FRAME
 {
 	uint8_t func;
@@ -70,10 +73,11 @@ struct ACK
 	uint16_t frame_id;
 	uint16_t crc;
 };
+#endif
 
-static uint16_t frame_id = 0;
-static uint16_t total_frame = 0;
-static uint32_t off_addr = 0;
+static uint16_t frame_id = 0;  /* from 0 */
+static uint16_t total_frame = 0; /* decieded by bytes and PAYLOAD_SIZE*/
+static uint32_t off_addr = 0;  /* offset address from the HEAD  */
 /**********************************************************************************/
 
 /**********************************************************************************/
@@ -84,8 +88,8 @@ typedef void*(*THREAD_FUNC)(void*);
 
 static int spi_read_len = 0;
 static int spi_write_len = 0;
-static uint8_t spi_read_buf[SPI_READ_BUF_LEN] = {0x00,};
-static uint8_t spi_write_buf[SPI_WRITE_BUF_LEN] = {0x00,};
+static uint8_t spi_read_buf[SPI_READ_BUF_SIZE] = {0x00,};
+static uint8_t spi_write_buf[SPI_WRITE_BUF_SIZE] = {0x00,};
 
 static pthread_t server_thread_id[SERVER_THREAD_COUNT] = {};
 static THREAD_FUNC server_thread[SERVER_THREAD_COUNT] = {monitor_cc2650_thread, process_request_thread};
@@ -158,7 +162,7 @@ void* process_request_thread(void* arg_info)
 		{
 		printf("process_request_thread:recv request command!\n");
 		request_frame = ((spi_read_buf[1]<<8) || (spi_read_buf[2]));
-		printf("request frame_id:%d\n", request_frame);
+		printf("request frame_id:%ld\n", request_frame);
 
 		off_addr = request_frame*PAYLOAD_SIZE;
 
@@ -181,10 +185,10 @@ int main(int argc, char *argv[])
 	int pthread_ret, thread_index;
 	static arg_info_t arg_info;
 	uint32_t file_len = 0;
-	uint32_t off_size = 0;
+	uint32_t single_off_size = 0;  //normally equals to PAYLOAD_SIZE or less.
 	//FILE* fd = (*(arg_info_pt)arg_info).fd;
 
-	if(argc != 1)
+	if(argc != 2)
 	{
 		fprintf(stderr,"Usage:%s filename\a\n",argv[0]);
 		return -1;
@@ -222,52 +226,55 @@ int main(int argc, char *argv[])
 	file_len = ftell(arg_info.fd);
 	printf("file_len = %ld\n", file_len);
 
-	total_frame = (file_len%PAYLOAD_SIZE)+1;
+	if(0 == (file_len%PAYLOAD_SIZE))
+	{
+		total_frame = (file_len/PAYLOAD_SIZE);
+	}
+	else
+	{
+		total_frame = (file_len/PAYLOAD_SIZE)+1;
+	}
 	printf("total_frame = %d\n", total_frame);
 
 	sleep(10);
 
 	/* 2,start OTA download */
 	printf("Start OTA download!\n");
-	while(off_addr <= file_len)
+
+	for(off_addr = 0; off_addr <= file_len; off_addr += PAYLOAD_SIZE)
 	{
 		sleep(1);
 
 		if((file_len - off_addr) > PAYLOAD_SIZE)
 		{
-			off_addr += PAYLOAD_SIZE;
-			off_size = PAYLOAD_SIZE;
+			single_off_size = PAYLOAD_SIZE;
 		}
 		else
 		{
-			off_addr += (file_len - off_addr);
-			off_size = (file_len - off_addr);
+			single_off_size = (file_len - off_addr);
 		}
-		printf("off_addr = %ld\t, off_size = %ld\n", off_addr-PAYLOAD_SIZE, off_size);
-
-
-		frame_id = off_addr%PAYLOAD_SIZE;
-		printf("frame_id = %d\n", frame_id);
+		frame_id = (off_addr/PAYLOAD_SIZE);
+		printf("frame_id = %ld\t, off_addr = %ld\t, single_off_size = %ld\n", frame_id, off_addr, single_off_size);
 
 		memset(spi_write_buf, 0, sizeof(spi_write_buf));
-
-		fseek(arg_info.fd, off_addr-PAYLOAD_SIZE, SEEK_SET);
-		fread(spi_write_buf+6, 1, off_size, arg_info.fd);
-
-		spi_write_buf[0] = 0x01; //FUNC
-		spi_write_buf[1] = frame_id>>8; //high byte
-		spi_write_buf[2] = frame_id; 
-		spi_write_buf[3] = total_frame>>8; 
-		spi_write_buf[4] = total_frame; 
-		spi_write_buf[5] = off_size; 
-		spi_write_buf[SPI_WRITE_BUF_LEN-2] = 0x12;  //CRC
-		spi_write_buf[SPI_WRITE_BUF_LEN-1] = 0x34;  //CRC
+		fseek(arg_info.fd, off_addr, SEEK_SET);
+		fread(spi_write_buf+6, 1, single_off_size, arg_info.fd);
+		spi_write_buf[0] = OTA_DOWNLOAD; //FUNC
+		spi_write_buf[1] = (uint8_t)(frame_id>>8); //high byte
+		spi_write_buf[2] = (uint8_t)frame_id; 
+		spi_write_buf[3] = (uint8_t)(total_frame>>8); 
+		spi_write_buf[4] = (uint8_t)total_frame; 
+		spi_write_buf[5] = single_off_size; 
+		spi_write_buf[5+single_off_size+1] = 0x12;  //CRC
+		spi_write_buf[5+single_off_size+2] = 0x34;  //CRC
 
 		//spi write
-		spi_write(arg_info.spi_fd, spi_write_buf, PAYLOAD_SIZE+7);
+		spi_write(arg_info.spi_fd, spi_write_buf, single_off_size+8);
 		printf("frame_id %d\t send out!\n", frame_id);
 
 	}
+		sleep(5);
+		printf("OTA DOWNLOAD FINISHED!\n");
 
 
 	atexit(main_exit);
